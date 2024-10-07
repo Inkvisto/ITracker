@@ -1,255 +1,245 @@
-use crate::csv_export::TaskLog;
-use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
+use csv::{ReaderBuilder, WriterBuilder};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Error as IoError, Write},
+    io::{BufReader, BufWriter, Error, ErrorKind},
     time::{Duration, SystemTime},
 };
 
-/// A struct to represent a Timer that tracks elapsed time, pause duration,
-/// daily logs, and task logs.
+pub trait TaskLog {
+    fn log_task(&mut self, data: &str, output_file: &str) -> Result<(), std::io::Error>;
+}
+
 pub struct Timer {
-    start_time: Option<SystemTime>,
-    stop_time: Option<SystemTime>,
-    pause_duration: Duration,
-    daily_log: HashMap<NaiveDate, Duration>,
-    task_logs: Vec<TaskLog>,
+    pub pause_duration: Duration,
+    pub is_paused: bool,
+    paused_time: Option<SystemTime>,
 }
 
 impl Timer {
-    /// Creates a new Timer instance.
     pub fn new() -> Self {
-        Self {
-            start_time: None,
-            stop_time: None,
-            pause_duration: Duration::default(),
-            daily_log: HashMap::new(),
-            task_logs: Vec::new(),
+        Timer {
+            pause_duration: Duration::new(0, 0),
+            is_paused: false,
+            paused_time: None,
         }
     }
 
-    /// Starts the timer by recording the current time.
-    pub fn start(&mut self) {
-        self.start_time = Some(SystemTime::now());
-        self.pause_duration = Duration::default(); // Reset pause duration
-    }
+    pub fn pause(&mut self, output_file: &str, index: usize) -> Result<(), std::io::Error> {
+        if !self.is_paused {
+            self.paused_time = Some(SystemTime::now());
+            self.is_paused = true;
 
-    /// Stops the timer and records the stop time.
-    pub fn stop(&mut self) {
-        self.stop_time = Some(SystemTime::now());
-    }
+            // Read the start time from the file for the specified index
+            let start_time = self.read_start_time_from_csv(output_file, index)?;
 
-    /// Returns the start time of the timer if it has been started.
-    ///
-    /// # Returns
-    /// An `Option<SystemTime>` containing the start time or `None` if not started.
-    pub fn started_time(&self) -> Option<SystemTime> {
-        self.start_time
-    }
-
-    /// Returns the stop time of the timer if it has been stopped.
-    ///
-    /// # Returns
-    /// An `Option<SystemTime>` containing the stop time or `None` if not stopped.
-    pub fn stopped_time(&self) -> Option<SystemTime> {
-        self.stop_time
-    }
-
-    /// Pauses the timer and records the duration since it started.
-    pub fn pause(&mut self) {
-        if let Some(start) = self.start_time {
-            self.pause_duration += SystemTime::now().duration_since(start).unwrap_or_default();
-            self.start_time = None;
-        }
-    }
-
-    /// Resumes the timer from a paused state.
-    pub fn resume(&mut self) {
-        if self.start_time.is_none() {
-            self.start_time = Some(SystemTime::now());
-        }
-    }
-
-    /// Returns the total elapsed time including any pause duration.
-    ///
-    /// # Returns
-    /// A `Duration` representing the total elapsed time.
-    pub fn elapsed(&self) -> Duration {
-        if let Some(start) = self.start_time {
-            SystemTime::now().duration_since(start).unwrap_or_default() + self.pause_duration
-        } else {
-            self.pause_duration
-        }
-    }
-
-    /// Logs the daily time spent on tasks.
-    ///
-    /// This method calculates the time spent from the start time to the stop time
-    /// (or now if not stopped), subtracting any pause duration, and logs it
-    /// under the current date.
-    pub fn log_daily_time(&mut self) -> Result<(), IoError> {
-        if let Some(start) = self.start_time {
-            let stop = self.stop_time.unwrap_or(SystemTime::now());
-            let elapsed = stop.duration_since(start).unwrap_or_default() - self.pause_duration;
-            let current_date = Local::now().date_naive();
-            *self
-                .daily_log
-                .entry(current_date)
-                .or_insert(Duration::default()) += elapsed;
+            // Write the paused time to the file
+            if let Some(paused_time) = self.paused_time {
+                let paused_duration = paused_time.duration_since(start_time).unwrap_or_default();
+                // Update the log entry in the CSV file with the paused duration
+                self.update_log_entry_with_paused_time(output_file, index, paused_duration)?;
+            }
         }
         Ok(())
     }
 
-    /// Saves the daily log to a specified output file.
-    ///
-    /// # Arguments
-    /// * `output_file` - A string slice that holds the path to the output file.
-    ///
-    /// # Returns
-    /// * `Result<(), IoError>` - An empty result on success or an error.
-    pub fn save_daily_log(&self, output_file: &str) -> Result<(), IoError> {
-        let mut file = self.open_file(output_file)?;
-        for (date, duration) in &self.daily_log {
-            writeln!(file, "{},{}", date, duration.as_secs())?;
+    pub fn resume(&mut self, output_file: &str, index: usize) -> Result<(), std::io::Error> {
+        if self.is_paused {
+            // Read the start time from the file for the specified index
+            let start_time = self.read_start_time_from_csv(output_file, index)?;
+
+            // Calculate paused duration
+            if let Some(paused_time) = self.paused_time {
+                let pause_duration = paused_time.duration_since(start_time).unwrap_or_default();
+                self.pause_duration += pause_duration; // Update total paused duration
+            }
+
+            self.is_paused = false; // Reset paused state
+            self.paused_time = None; // Reset paused time
         }
         Ok(())
     }
 
-    /// Returns a clone of the daily log summary.
-    ///
-    /// # Returns
-    /// A `HashMap<NaiveDate, Duration>` representing the daily log summary.
-    pub fn get_daily_summary(&self) -> HashMap<NaiveDate, Duration> {
-        self.daily_log.clone()
-    }
-
-    /// Returns a summary of the logged time for the current week.
-    ///
-    /// # Returns
-    /// A `HashMap<NaiveDate, Duration>` representing the weekly log summary.
-    pub fn get_weekly_summary(&self) -> HashMap<NaiveDate, Duration> {
-        let today = Local::now().date_naive();
-        let start_of_week =
-            today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
-
-        self.daily_log
-            .iter()
-            .filter(|(&date, _)| date >= start_of_week)
-            .map(|(date, duration)| (*date, *duration))
-            .collect()
-    }
-
-    /// Exports task logs to a CSV file.
-    ///
-    /// # Arguments
-    /// * `output_file` - A string slice that holds the path to the output file.
-    ///
-    /// # Returns
-    /// * `Result<(), IoError>` - An empty result on success or an error.
-    pub fn export_logs_to_csv(&self, output_file: &str) -> Result<(), IoError> {
-        TaskLog::export_to_csv(&self.task_logs, output_file)
-    }
-
-    /// Logs a task with the specified data and duration to the output file.
-    ///
-    /// # Arguments
-    /// * `data` - A string slice containing task details.
-    /// * `output_file` - A string slice that holds the path to the output file.
-    /// * `program_start_time` - The time when the program started.
-    ///
-    /// # Returns
-    /// * `Result<(), IoError>` - An empty result on success or an error.
-    pub fn log_task(
-        &mut self,
-        data: &str,
+    pub fn get_elapsed_time(
+        &self,
         output_file: &str,
-        program_start_time: SystemTime,
-    ) -> Result<(), IoError> {
-        let datetime: DateTime<Utc> = program_start_time.into();
-        let duration = self.elapsed();
+        index: usize,
+    ) -> Result<Duration, std::io::Error> {
+        // Read the start time from the file for the specified index
+        let start_time = self.read_start_time_from_csv(output_file, index)?;
 
-        let task_log = TaskLog::new(data.to_string(), datetime, duration);
-        self.task_logs.push(task_log);
+        if self.is_paused {
+            return Ok(self.pause_duration);
+        }
 
-        // Read the file to find the last used index
-        let mut current_index = 0;
-        if let Ok(file) = File::open(output_file) {
-            let reader = BufReader::new(file);
+        // Calculate the elapsed time
+        let elapsed = start_time.elapsed().unwrap_or_default() - self.pause_duration;
+        Ok(elapsed)
+    }
 
-            // Search for the highest existing log entry index
-            for line in reader.lines() {
-                let line = line?;
-                if line.starts_with(" Log Entry: ") {
-                    if let Some(entry) = line.split_whitespace().last() {
-                        if let Ok(parsed_index) = entry.parse::<usize>() {
-                            if parsed_index > current_index {
-                                current_index = parsed_index;
-                            }
+    /// Reads the start time from the CSV file for the given index.
+    fn read_start_time_from_csv(
+        &self,
+        output_file: &str,
+        index: usize,
+    ) -> Result<SystemTime, std::io::Error> {
+        let file = OpenOptions::new().read(true).open(output_file)?;
+        let mut reader = ReaderBuilder::new().from_reader(BufReader::new(file));
+
+        for result in reader.records() {
+            let record = result?;
+            if record.len() >= 5 {
+                // Parse the index from the first field
+                if let Ok(record_index) = record[0].parse::<usize>() {
+                    if record_index == index {
+                        // Parse the start time from the second field
+                        if let Ok(start_time) = DateTime::parse_from_rfc2822(&record[1]) {
+                            return Ok(start_time.with_timezone(&Utc).into());
                         }
                     }
                 }
             }
         }
+        Err(Error::new(
+            ErrorKind::NotFound,
+            "Start time not found for the specified index",
+        ))
+    }
 
-        // Increment the index for the new log entry
-        let index = current_index + 1;
+    pub fn update_log_entry_with_elapsed_time(
+        &self,
+        output_file: &str,
+        index: usize,
+        elapsed_time: Duration,
+        paused_time: Duration,
+    ) -> Result<(), std::io::Error> {
+        let mut records = self.read_csv_records(output_file)?;
 
-        let mut file = self.open_file(output_file)?;
-        let width = self.get_terminal_width();
-        let line = "-".repeat(width);
+        // Modify the specific log entry with the elapsed time and paused duration
+        if let Some(record) = records.get_mut(index.saturating_sub(1)) {
+            // index - 1 to adjust for zero-based index
+            if record.len() >= 5 {
+                // Update Elapsed Time
+                record[3] = elapsed_time.as_secs().to_string();
+                // Update the paused duration
+                record[4] = paused_time.as_secs().to_string();
+            } else {
+                // If there are not enough fields, create a valid record
+                record.push(paused_time.as_secs().to_string());
+            }
+        }
 
-        // Write the new log entry with the next index
-        writeln!(file, "\n Log Entry: {}", index)?; // Add incremented index here
-        writeln!(file, " Start Time: {}", datetime.to_rfc2822())?;
-        writeln!(file, " {}", data)?;
-        writeln!(file, " Elapsed Time: {} seconds", duration.as_secs())?;
-        writeln!(file, "{}", line)?;
+        self.write_csv_records(output_file, &records)?;
 
         Ok(())
     }
 
-    /// Opens a file for appending log entries.
-    ///
-    /// # Arguments
-    /// * `output_file` - A string slice that holds the path to the output file.
-    ///
-    /// # Returns
-    /// * `Result<File, IoError>` - A result containing the opened file or an error.
-    fn open_file(&self, output_file: &str) -> Result<File, IoError> {
-        Ok(OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(output_file)?)
+    pub fn update_log_entry_with_paused_time(
+        &self,
+        output_file: &str,
+        index: usize,
+        paused_duration: Duration,
+    ) -> Result<(), std::io::Error> {
+        let mut records = self.read_csv_records(output_file)?;
+
+        // Modify the specific log entry with the paused duration
+        if let Some(record) = records.get_mut(index.saturating_sub(1)) {
+            if record.len() >= 5 {
+                // Update the paused duration in the CSV
+                record[4] = paused_duration.as_secs().to_string();
+            }
+        }
+
+        self.write_csv_records(output_file, &records)?;
+
+        Ok(())
     }
 
-    /// Retrieves the terminal width, defaulting to 80 if unavailable.
-    ///
-    /// # Returns
-    /// A `usize` representing the width of the terminal.
-    fn get_terminal_width(&self) -> usize {
-        std::env::var("COLUMNS")
-            .unwrap_or_else(|_| "80".to_string())
-            .parse::<usize>()
-            .unwrap_or(80)
+    fn read_csv_records(&self, output_file: &str) -> Result<Vec<Vec<String>>, std::io::Error> {
+        let file = OpenOptions::new().read(true).open(output_file)?;
+        let mut reader = ReaderBuilder::new().from_reader(BufReader::new(file));
+        let mut records = Vec::new();
+
+        // Read the CSV records
+        for result in reader.records() {
+            let record = result?;
+            records.push(record.iter().map(|s| s.to_string()).collect());
+        }
+
+        Ok(records)
+    }
+
+    fn write_csv_records(
+        &self,
+        output_file: &str,
+        records: &[Vec<String>],
+    ) -> Result<(), std::io::Error> {
+        // Write the updated records back to the CSV file
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true) // Clear the file before writing
+            .open(output_file)?;
+
+        let mut writer = WriterBuilder::new().from_writer(BufWriter::new(file));
+
+        // Write headers (including paused duration)
+        writer.write_record(&[
+            "Index",
+            "Start Time",
+            "Task Description",
+            "Elapsed Time (seconds)",
+            "Paused Duration (seconds)",
+        ])?;
+
+        // Write the updated records
+        for record in records {
+            writer.write_record(record)?;
+        }
+
+        writer.flush()?;
+        Ok(())
     }
 }
 
-/// Function to log elapsed time to a file.
-///
-/// # Arguments
-/// * `elapsed` - A `Duration` representing the elapsed time to log.
-/// * `output_file` - A string slice that holds the path to the output file.
-///
-/// # Returns
-/// * `Result<(), IoError>` - An empty result on success or an error.
-pub fn log_elapsed_time(elapsed: Duration, output_file: &str) -> Result<(), IoError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_file)?;
+impl TaskLog for Timer {
+    fn log_task(&mut self, data: &str, output_file: &str) -> Result<(), std::io::Error> {
+        let file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(output_file)?;
 
-    writeln!(file, "Elapsed time: {:?} seconds", elapsed.as_secs())?;
+        let is_empty = file.metadata()?.len() == 0;
 
-    Ok(())
+        let mut writer = csv::Writer::from_writer(BufWriter::new(file));
+
+        if is_empty {
+            writer.write_record(&[
+                "Index",
+                "Start Time",
+                "Task Description",
+                "Elapsed Time (seconds)",
+                "Paused Duration (seconds)",
+            ])?;
+        }
+
+        let current_index = {
+            let mut reader = csv::Reader::from_reader(BufReader::new(File::open(output_file)?));
+            reader.records().count() // Count the total number of records
+        };
+
+        let index = current_index + 1;
+
+        writer.write_record(&[
+            index.to_string(),
+            Utc::now().to_rfc2822(),
+            data.to_string(),
+            "0".to_string(), // Elapsed time, initialized to 0
+            "0".to_string(), // Paused duration, initialized to 0
+        ])?;
+
+        writer.flush()?;
+        Ok(())
+    }
 }

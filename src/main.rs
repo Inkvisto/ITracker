@@ -1,18 +1,22 @@
 mod args;
 mod config;
-mod csv_export;
 mod log;
 mod timer;
 mod tui;
 
 use args::Args;
-use clap::{error::ErrorKind, Parser};
+use chrono::{DateTime, Utc};
+use clap::{error::ErrorKind as ClapErrorKind, Parser};
 use config::{load_config, save_config};
+use csv::ReaderBuilder;
 use log::read_logs_from_file;
-use std::time::SystemTime;
-use timer::{log_elapsed_time, Timer};
+use std::{
+    fs::{File, OpenOptions},
+    io::{BufReader, Error, ErrorKind},
+    time::{Duration, SystemTime},
+};
+use timer::{TaskLog, Timer};
 
-/// Main function to execute the program logic.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args = parse_args();
@@ -48,27 +52,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Using output file: {}", output_file);
 
     // Handle timer commands like start, pause, resume, and stop
-    handle_timer_commands(args, data, &output_file)?;
+    handle_commands(args, data, &output_file)?;
 
     Ok(())
 }
 
-/// Helper function to parse command line arguments.
 fn parse_args() -> Args {
     Args::try_parse().unwrap_or_else(|err| {
-        if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
-            // Print help or version information
+        if err.kind() == ClapErrorKind::DisplayHelp || err.kind() == ClapErrorKind::DisplayVersion {
             eprintln!("{}", err);
         } else {
-            // Optionally, you can print a custom error message
             eprintln!("Error parsing arguments: {}", err);
         }
-        // Return a default instance of Args
-        Args::default() // Ensure Args implements Default trait or return an appropriate fallback
+        Args::default()
     })
 }
 
-/// Helper function to manage configuration loading/saving.
 fn manage_config(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
     let mut config = load_config()?;
 
@@ -78,114 +77,124 @@ fn manage_config(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
         save_config(&config)?;
         file_str
     } else {
-        config.output_file.clone().unwrap_or_default()
+        config
+            .output_file
+            .clone()
+            .unwrap_or_else(|| String::from("default_output.txt"))
     };
 
     Ok(output_file)
 }
 
-/// Handle timer commands like start, pause, resume, and stop.
-fn handle_timer_commands(
-    args: Args,
-    data: String,
-    output_file: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_commands(args: Args, data: String, output_file: &str) -> Result<(), std::io::Error> {
     let mut timer = Timer::new();
 
-    if args.start {
-        start_timer(&mut timer);
+    if args.add {
+        let log_index = start_timer(&mut timer, &data, output_file)?;
+        println!("Timer started for log entry at index {}.", log_index);
     }
+
     if args.pause {
-        pause_timer(&mut timer);
+        timer.pause(output_file, 1)?;
     }
+
     if args.resume {
-        resume_timer(&mut timer);
-    }
-    if !data.is_empty() {
-        log_task_details(&mut timer, &data, output_file)?;
-    }
-    if args.stop {
-        stop_timer(&mut timer, output_file)?;
+        timer.resume(output_file, 0)?;
+        let elapsed_time = timer.get_elapsed_time(output_file, 1)?;
+        println!("Timer paused. Total elapsed time: {:?}", elapsed_time);
     }
 
-    // Log daily time and save it to a file after stopping the timer
-    timer.log_daily_time()?;
-    timer.save_daily_log(output_file)?;
-
-    // Optionally, show summaries if needed
-    if args.show_daily_summary {
-        print_summary("Daily Summary", timer.get_daily_summary());
-    }
-    if args.show_weekly_summary {
-        print_summary("Weekly Summary", timer.get_weekly_summary());
-    }
-
-    // Export logs to CSV if requested
-    if args.export_to_csv {
-        timer.export_logs_to_csv(output_file)?;
+    if args.stop.is_some() {
+        let index = args
+            .stop
+            .unwrap_or_else(|| get_last_index_from_csv(output_file).unwrap_or(0));
+        stop_timer(&mut timer, output_file, index)?;
     }
 
     Ok(())
 }
 
-/// Start the timer.
-fn start_timer(timer: &mut Timer) {
-    timer.start();
-    println!("Timer started.");
+fn start_timer(timer: &mut Timer, data: &str, output_file: &str) -> Result<usize, std::io::Error> {
+    // Log the task and return the index of the log entry
+    timer.log_task(data, output_file)?;
+
+    // Calculate the log index based on the CSV file contents
+    let log_index = {
+        let mut reader = csv::Reader::from_reader(File::open(output_file)?);
+        reader.records().count()
+    };
+
+    Ok(log_index)
 }
 
-/// Pause the timer.
-fn pause_timer(timer: &mut Timer) {
-    timer.pause();
-    println!("Timer paused.");
-}
+fn stop_timer(timer: &mut Timer, output_file: &str, index: usize) -> Result<(), std::io::Error> {
+    let stopped_time = SystemTime::now();
+    let (start_time, paused_duration) =
+        read_start_time_and_paused_duration_from_csv(output_file, index)?;
 
-/// Resume the timer.
-fn resume_timer(timer: &mut Timer) {
-    timer.resume();
-    println!("Timer resumed.");
-}
+    let elapsed_time = stopped_time.duration_since(start_time).unwrap_or_default();
 
-/// Log task details to the timer.
-fn log_task_details(
-    timer: &mut Timer,
-    data: &str,
-    output_file: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    timer.log_task(data, output_file, SystemTime::now())?;
-    Ok(())
-}
-
-/// Stop the timer and log the elapsed time.
-fn stop_timer(timer: &mut Timer, output_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    timer.stop();
-    let stopped_time = timer.stopped_time().unwrap();
-    let elapsed_time = stopped_time
-        .duration_since(timer.started_time().unwrap())
-        .unwrap_or_default();
+    timer.update_log_entry_with_elapsed_time(output_file, index, elapsed_time, paused_duration)?;
 
     println!(
-        "Timer stopped at {:?}. Elapsed time: {:?}",
-        stopped_time, elapsed_time
+        "Timer stopped at {:?}. Elapsed time: {:?}, Total paused time: {:?}",
+        stopped_time,
+        elapsed_time.as_secs(),
+        paused_duration.as_secs()
     );
-
-    // Log the elapsed time
-    log_elapsed_time(elapsed_time, output_file)?;
 
     Ok(())
 }
 
-/// Function to print summaries.
-fn print_summary(
-    title: &str,
-    summary: std::collections::HashMap<chrono::NaiveDate, std::time::Duration>,
-) {
-    println!("\n{}:", title);
-    for (date, duration) in summary {
-        println!(
-            "Date: {}, Time Logged: {} seconds",
-            date,
-            duration.as_secs()
-        );
+fn read_start_time_and_paused_duration_from_csv(
+    output_file: &str,
+    index: usize,
+) -> Result<(SystemTime, Duration), std::io::Error> {
+    let file = OpenOptions::new().read(true).open(output_file)?;
+    let mut reader = ReaderBuilder::new().from_reader(BufReader::new(file));
+
+    for result in reader.records() {
+        let record = result?;
+        if record.len() >= 5 {
+            if let Ok(record_index) = record[0].parse::<usize>() {
+                if record_index == index {
+                    if let Ok(start_time) = DateTime::parse_from_rfc2822(&record[1]) {
+                        let paused_duration = record[4].parse::<u64>().unwrap_or_default();
+                        return Ok((
+                            start_time.with_timezone(&Utc).into(),
+                            Duration::from_secs(paused_duration),
+                        ));
+                    } else {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "Invalid start time format in CSV",
+                        ));
+                    }
+                }
+            }
+        }
     }
+
+    Err(Error::new(
+        ErrorKind::NotFound,
+        "No valid start time or paused duration found for the specified index in CSV",
+    ))
+}
+
+fn get_last_index_from_csv(output_file: &str) -> Result<usize, std::io::Error> {
+    let file = OpenOptions::new().read(true).open(output_file)?;
+    let mut reader = ReaderBuilder::new().from_reader(BufReader::new(file));
+
+    let mut last_index: Option<usize> = None;
+
+    for result in reader.records() {
+        let record = result?;
+        if let Some(index_str) = record.get(0) {
+            if let Ok(index) = index_str.parse::<usize>() {
+                last_index = Some(index);
+            }
+        }
+    }
+
+    last_index.ok_or_else(|| Error::new(ErrorKind::Other, "No valid index found in CSV"))
 }

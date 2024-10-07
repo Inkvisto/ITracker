@@ -1,15 +1,15 @@
-use std::error::Error;
+use csv::{ReaderBuilder, WriterBuilder};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufReader, BufWriter};
 
-/// Represents a single log entry with an index, start time, message, and elapsed time.
+/// Represents a single log entry with an index, start time, message, elapsed time, and paused time.
 #[derive(Debug)]
 pub struct LogEntry {
     pub index: usize,         // Index of the log entry
     pub start_time: String,   // Start time of the log entry
     pub message: String,      // Message associated with the log entry
     pub elapsed_time: String, // Elapsed time recorded in the log entry
+    pub paused_time: String,  // Paused time recorded in the log entry
 }
 
 /// Reads logs from a specified file and returns a vector of `LogEntry`.
@@ -21,61 +21,37 @@ pub struct LogEntry {
 /// - `Ok(Vec<LogEntry>)`: A vector of log entries if successful.
 /// - `Err(std::io::Error)`: An error if file operations fail.
 pub fn read_logs_from_file(file_path: &str) -> Result<Vec<LogEntry>, std::io::Error> {
-    let path = Path::new(file_path);
-    let file = File::open(&path)?;
-    let reader = BufReader::new(file);
+    // Open the CSV file for reading
+    let file = File::open(file_path)?;
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(BufReader::new(file));
+
     let mut entries = Vec::new();
-    let mut current_entry: Option<LogEntry> = None;
 
-    for line in reader.lines() {
-        let line = line?;
+    // Iterate over each record in the CSV file
+    for result in reader.records() {
+        let record = result.map_err(|e| io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        if line.trim().starts_with("Log Entry:") {
-            // If we have a current entry, save it before creating a new one
-            if let Some(entry) = current_entry.take() {
-                entries.push(entry);
-            }
-
-            // Create a new log entry and extract the index
-            let index = line.trim()[10..].trim().parse::<usize>().unwrap_or(0);
-            current_entry = Some(LogEntry {
-                index,
-                start_time: String::new(),
-                message: String::new(),
-                elapsed_time: String::new(),
-            });
-        } else if line.trim().starts_with("Start Time:") {
-            if let Some(ref mut entry) = current_entry {
-                entry.start_time = line.trim()[12..].trim().to_string();
-            }
-        } else if line.trim().starts_with("Elapsed Time:") {
-            if let Some(ref mut entry) = current_entry {
-                entry.elapsed_time = line.trim()[14..].trim().to_string();
-            }
-        } else if !line.trim().starts_with("----") {
-            // Ignore lines that are just delimiters
-            // This line is considered part of the message
-            if let Some(ref mut entry) = current_entry {
-                entry.message.push_str(&format!("{}\n", line.trim()));
-            }
-        }
+        // Parse each field from the CSV into the LogEntry struct
+        let entry = LogEntry {
+            index: record[0]
+                .parse::<usize>()
+                .map_err(|e| io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            start_time: record[1].to_string(),
+            message: record[2].to_string(),
+            elapsed_time: record[3].to_string(),
+            paused_time: record.get(4).unwrap_or(&"0".to_string()).to_string(), // Default to "0" if not present
+        };
+        entries.push(entry);
     }
 
-    // Push the last entry if it exists and is not empty
-    if let Some(entry) = current_entry {
-        if !entry.start_time.is_empty()
-            || !entry.message.is_empty()
-            || !entry.elapsed_time.is_empty()
-        {
-            entries.push(entry);
-        }
-    }
     Ok(entries)
 }
 
 /// Deletes a log entry by its index from the specified log file.
 ///
-/// This function searches for a log entry by its index, and removes it along with
+/// This function searches for a log entry by its index and removes it along with
 /// the associated information (up to the next delimiter).
 ///
 /// # Arguments
@@ -85,48 +61,52 @@ pub fn read_logs_from_file(file_path: &str) -> Result<Vec<LogEntry>, std::io::Er
 /// # Returns
 /// - `Ok(())`: If the deletion is successful.
 /// - `Err(std::io::Error)`: An error if file operations fail.
-pub fn delete_log_entry(log_file: &str, index: usize) -> Result<(), std::io::Error> {
+pub fn delete_log_entry(log_file: &str, index: usize) -> Result<(), io::Error> {
+    // Open the CSV file for reading
     let file = File::open(log_file)?;
-    let reader = BufReader::new(file);
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(BufReader::new(file));
 
-    // Collect all the lines from the log file
-    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+    // Read all existing records and filter out the entry with the specified index
+    let mut updated_records = Vec::new();
+    for result in reader.records() {
+        let record = result.map_err(|e| io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let record_index: usize = record[0]
+            .parse()
+            .map_err(|e| io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Prepare to store the updated logs
-    let mut updated_logs = Vec::new();
-    let mut delete_mode = false;
-
-    for line in lines.iter() {
-        if delete_mode {
-            // If we are in delete mode, skip lines until we hit the delimiter
-            if line.trim().starts_with("----") {
-                delete_mode = false; // End delete mode after processing the delimiter
-            }
-            continue; // Skip all lines in delete mode
+        if record_index != index {
+            updated_records.push(record.clone());
         }
-
-        // Look for the log entry to delete
-        if line.trim() == format!("Log Entry: {}", index) {
-            delete_mode = true; // Start deleting lines once the log entry is found
-            continue; // Skip the line with "Log Entry: <index>"
-        }
-
-        // Add the line to the updated logs if it's not part of the deleted block
-        updated_logs.push(line.clone());
     }
 
-    // Overwrite the log file with the remaining entries
+    // Open the CSV file for writing (truncate it to start fresh)
     let output_file = OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(log_file)?;
 
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = WriterBuilder::new()
+        .has_headers(true)
+        .from_writer(BufWriter::new(output_file));
 
-    // Write the remaining lines back to the file
-    for line in updated_logs {
-        writeln!(writer, "{}", line)?;
+    // Write the header to the CSV file
+    writer.write_record(&[
+        "Index",
+        "Start Time",
+        "Task Description",
+        "Elapsed Time (seconds)",
+        "Paused Time (seconds)",
+    ])?;
+
+    // Write the remaining records back to the file
+    for record in updated_records {
+        writer
+            .write_record(&record)
+            .map_err(|e| io::Error::new(std::io::ErrorKind::WriteZero, e))?;
     }
 
+    writer.flush()?;
     Ok(())
 }

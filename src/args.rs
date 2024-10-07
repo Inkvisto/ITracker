@@ -16,13 +16,9 @@ pub struct Args {
     #[arg(short = 'o', long = "output-file")]
     pub output_file: Option<PathBuf>,
 
-    /// Start the timer
-    #[arg(short = 's', action = clap::ArgAction::SetTrue)]
-    pub start: bool,
-
     /// Stop the timer
-    #[arg(short = 't', action = clap::ArgAction::SetTrue)]
-    pub stop: bool,
+    #[arg(short = 't', long = "stop", value_name = "INDEX")]
+    pub stop: Option<usize>,
 
     /// Add a new task
     #[arg(short = 'a', long="add",action = clap::ArgAction::SetTrue)]
@@ -36,19 +32,7 @@ pub struct Args {
     #[arg(short = 'r', long = "resume", action = clap::ArgAction::SetTrue)]
     pub resume: bool,
 
-    /// Show the daily summary
-    #[arg(long = "show-daily-summary", action = clap::ArgAction::SetTrue)]
-    pub show_daily_summary: bool,
-
-    /// Show the weekly summary
-    #[arg(long = "show-weekly-summary", action = clap::ArgAction::SetTrue)]
-    pub show_weekly_summary: bool,
-
     /// Delete a specific log entry by index
     #[arg(short = 'd', long = "delete-log", value_name = "INDEX")]
     pub delete_log: Option<usize>,
-
-    /// Export logs to CSV
-    #[arg(long = "export-to-csv", action = clap::ArgAction::SetTrue)]
-    pub export_to_csv: bool,
 }
